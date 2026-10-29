@@ -1,0 +1,277 @@
+
+import json
+import time
+from datetime import datetime, timezone
+
+import requests
+
+BASE_URL = "https://api.github.com"
+TIMEOUT = 10
+
+usuarios_teste = ["octocat", "torvalds"]
+
+# Resultados mantidos em memória para exportação
+resultados = {}
+
+
+def requisitar(endpoint, params=None):
+    """Faz requisições à API com tratamento de erros."""
+    url = f"{BASE_URL}{endpoint}"
+
+    try:
+        resposta = requests.get(
+            url,
+            params=params,
+            timeout=TIMEOUT,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+
+        if resposta.status_code in (403, 429):
+            restante = resposta.headers.get("X-RateLimit-Remaining")
+            reset = resposta.headers.get("X-RateLimit-Reset")
+            retry_after = resposta.headers.get("Retry-After")
+
+            if retry_after:
+                espera = int(retry_after)
+            elif restante == "0" and reset:
+                espera = max(0, int(reset) - int(time.time()))
+            else:
+                espera = None
+
+            print("\nLimite de requisições do GitHub atingido")
+            if espera is not None:
+                print(f"Tente novamente em aproximadamente {espera} segundos.")
+            else:
+                print("Acesso negado ou limite secundário. Tente mais tarde.")
+            return None
+
+        if resposta.status_code == 404:
+            print("Recurso não encontrado.")
+            return None
+
+        resposta.raise_for_status()
+        return resposta.json()
+
+    except requests.exceptions.Timeout:
+        print("Erro: a requisição excedeu o tempo limite.")
+    except requests.exceptions.ConnectionError:
+        print("Erro: não foi possível conectar à API do GitHub.")
+    except requests.exceptions.HTTPError as erro:
+        print(f"Erro HTTP: {erro}")
+    except requests.exceptions.RequestException as erro:
+        print(f"Erro na requisição: {erro}")
+    except ValueError:
+        print("Erro: a API retornou uma resposta JSON inválida.")
+
+    return None
+
+
+def buscar_usuario(nome):
+    """Busca e exibe o perfil de um usuário."""
+    perfil = requisitar(f"/users/{nome}")
+
+    if perfil is None:
+        return
+
+    dados = {
+        "perfil": perfil,
+        "repositorios": resultados.get(nome, {}).get(
+            "repositorios", []
+        ),
+    }
+    resultados[nome] = dados
+
+    print(f"\n=== Perfil: {perfil.get('login', nome)} ===")
+    print(f"Nome: {perfil.get('name') or 'Não informado'}")
+    print(f"Repos públicos: {perfil.get('public_repos', 0)}")
+    print(f"Seguidores: {perfil.get('followers', 0)}")
+    print(f"Seguindo: {perfil.get('following', 0)}")
+    print(f"URL: {perfil.get('html_url')}")
+
+
+def listar_repositorios(nome):
+    """Lista repositórios usando paginação."""
+    pagina = 1
+    por_pagina = 30
+    repositorios = []
+
+    while True:
+        dados = requisitar(
+            f"/users/{nome}/repos",
+            params={
+                "page": pagina,
+                "per_page": por_pagina,
+                "sort": "updated",
+            },
+        )
+
+        if dados is None:
+            # Não sobrescreve os dados anteriores com uma lista incompleta.
+            return
+
+        if not dados:
+            break
+
+        repositorios.extend(dados)
+
+        print(f"Página {pagina} carregada: {len(dados)} repositórios.")
+
+        if len(dados) < por_pagina:
+            break
+
+        pagina += 1
+
+        continuar = input(
+            "Carregar próxima página? (s/n): "
+        ).strip().lower()
+
+        if continuar != "s":
+            break
+
+    resultados.setdefault(nome, {
+        "perfil": None,
+        "repositorios": [],
+    })
+    resultados[nome]["repositorios"] = repositorios
+
+    print(f"\n=== Repositórios de {nome} ===")
+
+    for i, repo in enumerate(repositorios, start=1):
+        linguagem = repo.get("language") or "N/A"
+        print(
+            f"{i}. {repo['name']:<25} "
+            f"★ {repo.get('stargazers_count', 0):<8} "
+            f"({linguagem})"
+        )
+
+    print(f"\nTotal carregado: {len(repositorios)}")
+
+
+def detalhar_repositorio(nome):
+    """Consulta os detalhes de um repositório específico."""
+    repositorio = input("Nome do repositório: ").strip()
+
+    if not repositorio:
+        print("O nome do repositório não pode estar vazio.")
+        return
+
+    dados = requisitar(f"/repos/{nome}/{repositorio}")
+
+    if dados is None:
+        return
+
+    resultados.setdefault(nome, {
+        "perfil": None,
+        "repositorios": [],
+    })
+
+    resultados[nome].setdefault("detalhes", {})
+    resultados[nome]["detalhes"][repositorio] = dados
+
+    print(f"\n=== Repositório: {dados['full_name']} ===")
+    print(f"Descrição: {dados.get('description') or 'Sem descrição'}")
+    print(f"Linguagem: {dados.get('language') or 'N/A'}")
+    print(f"Estrelas: {dados.get('stargazers_count', 0)}")
+    print(f'Forks: {dados.get("forks_count", 0)}')
+    print(f'Issues abertas: {dados.get("open_issues_count", 0)}')
+    print(f"Branch padrão: {dados.get('default_branch')}")
+    print(f"URL: {dados.get('html_url')}")
+    print(f"Criado em: {dados.get('created_at')}")
+    print(f"Última atualização: {dados.get('updated_at')}")
+
+
+def salvar_json():
+    """Exporta os resultados coletados para arquivos JSON."""
+    if not resultados:
+        print("Nenhum resultado para salvar.")
+        return
+
+    for nome, dados in resultados.items():
+        # Evita salvar um perfil ausente como se fosse válido.
+        if dados.get("perfil") is None:
+            print(
+                f"Perfil de {nome} não carregado; "
+                "busque o usuário antes de exportar."
+            )
+            continue
+
+        arquivo = f"github_{nome}.json"
+
+        documento = {
+            "consultado_em": datetime.now(timezone.utc).isoformat(),
+            "perfil": dados["perfil"],
+            "repositorios": dados.get("repositorios", []),
+            "detalhes": dados.get("detalhes", {}),
+        }
+
+        try:
+            with open(arquivo, "w", encoding="utf-8") as f:
+                json.dump(
+                    documento,
+                    f,
+                    ensure_ascii=False,
+                    indent=4,
+                )
+            print(f"Resultados salvos em {arquivo}")
+        except OSError as erro:
+            print(f"Erro ao salvar {arquivo}: {erro}")
+
+
+def escolher_usuario():
+    print("\nUsuários de teste:")
+    for usuario in usuarios_teste:
+        print(f"- {usuario}")
+
+    nome = input(
+        "Digite o nome de usuário do GitHub: "
+    ).strip()
+
+    if not nome:
+        print("O usuário não pode estar vazio.")
+        return None
+
+    return nome
+
+
+def menu():
+    while True:
+        print("\n========== GITHUB API ==========")
+        print("1. Buscar usuário")
+        print("2. Listar repositórios (com paginação)")
+        print("3. Detalhar um repositório")
+        print("4. Salvar resultados em JSON")
+        print("0. Sair")
+
+        opcao = input("Escolha uma opção: ").strip()
+
+        if opcao == "1":
+            nome = escolher_usuario()
+            if nome:
+                buscar_usuario(nome)
+
+        elif opcao == "2":
+            nome = escolher_usuario()
+            if nome:
+                listar_repositorios(nome)
+
+        elif opcao == "3":
+            nome = escolher_usuario()
+            if nome:
+                detalhar_repositorio(nome)
+
+        elif opcao == "4":
+            salvar_json()
+
+        elif opcao == "0":
+            print("Programa encerrado.")
+            break
+
+        else:
+            print("Opção inválida. Escolha entre 0 e 4.")
+
+
+if __name__ == "__main__":
+    menu()
